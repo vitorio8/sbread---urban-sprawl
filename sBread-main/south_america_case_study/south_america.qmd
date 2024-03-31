@@ -1,0 +1,335 @@
+---
+title: "sBread - South America case study"
+author: "Peter Ranacher"
+format: 
+  html:
+    embed-resources: true
+    self-contained-math: true
+bibliography: references.bib
+editor: visual
+---
+
+This markdown prepares language polygons for analysis with the `sBread` software (<https://github.com/takuya-tkhs/sBread>). `sBread` is a Bayesian algorithm modelling the spread of a phenomenon in geographic space [@takahashi2023sBread]. Here, we use the algorithm to infer the spatial diffusion of the Indo-European (IE) languages in South America. We create a hexagonal grid for South America, match language areas to the grid and evaluate neighbourhood relationships between grid cells.
+
+The script returns two items:
+
+1.  `history`: a matrix with snapshots of the spatial distribution of IE languages from the first arrivals in the 16th century until today mapped to a spatial grid. The initial and current distribution of IE are known, while the distributions between them will be inferred. In the matrix, the rows are snapshots in time, and the columns are the spatial grid cells.
+
+2.  `adj_list`: an adjacency list of the neighbourhood relationships in the spatial grid.
+
+## Packages
+
+```{r, packages, message=FALSE}
+library(tidyverse)
+library(sf)
+library(spdep)
+library(raster)
+library(igraph)
+library(gdistance)
+library(gridExtra)
+library(kableExtra)
+```
+
+## A hexagonal grid for South America
+
+First, we load the land polygons, including major islands from [Natural Earth 1:10m Physical Vectors](https://www.naturalearthdata.com/downloads/10m-physical-vectors). We crop out the South American continent and parts of the Isthmus of Panama, removing North America and all islands. Subsequently, we reproject South America to the Transverse Cylindrical Equal Area coordinate reference system (CRS). This metric and equal-area CRS was suggested by the Projection Wizard tool [@savric2016mapwizard].
+
+```{r america, message = FALSE, warning = FALSE, results='hide'}
+
+# Load polygon, crop and reproject to an equal area CRS
+crs_eq_area <- st_crs("+proj=tcea +lon_0=-57.3046875 +datum=WGS84 +units=m +no_defs")
+
+
+america <- st_read("data/ne_10m_land/ne_10m_land.shp") %>%
+  st_crop(xmin = -100 , ymin = -60, xmax = -20, ymax = 15) %>%
+  st_cast("POLYGON") %>%
+  filter(!is.null(geometry)) %>%
+  mutate(area = st_area(geometry) %>% as.vector()) %>% 
+  arrange(desc(area)) %>%
+  slice(1:2) %>%
+  st_difference(st_bbox(c(xmin = -100, ymin = 6, 
+                          xmax = -81, ymax = 20),
+                        crs = 4326) %>% st_as_sfc()) %>%
+  st_transform(crs_eq_area)
+
+ggplot(america) +
+  geom_sf() +
+  theme_minimal()
+```
+
+Next, we generate a hexagonal grid. We obtain the bounding box of South America and fill it with hexagonal polygons with a cell size of 50 km. We apply a filter to retain only those grid cells intersecting with South America.
+
+```{r hex grid, message=FALSE, warning=FALSE}
+# cell size in metres
+cellsize = 50000
+
+# Generate the hexagonal grid
+bbox <- america %>% st_bbox() %>% st_as_sfc()
+grid <- st_make_grid(bbox, what = "polygons", 
+                     cellsize = cellsize, square = FALSE, flat_topped = FALSE) %>%
+  st_as_sf()
+  
+st_geometry(grid) = "geom"
+
+# Filter grid cells intersecting with South America 
+america_grid <- grid %>%
+  st_filter(america, .predicates = st_within) %>%
+  mutate(id = row_number())
+
+ggplot(america_grid) +
+  geom_sf(aes())
+
+```
+
+## Matching language areas to the grid
+
+We match the IE languages to the hexagonal grid. The current language areas were digitised from the Atlas of the World's Languages [@asher2018atlas]. The historical locations of the first settlements of Indo-European speakers were compiled by Geneviève Hannes in the Master's thesis titled 'Interpolating spatial language evolution in South America[@Hannes2023Interpolating]
+
+```{r language polygons, message=FALSE, warning=FALSE, warning = FALSE, results='hide'}
+current_ie <- st_read("data/language_polygons_current.json") %>%
+  filter(family == "Indo-European") %>%
+  st_transform(crs_eq_area)
+
+
+historical_ie <- read_csv("data/historical_seeds_ie.csv") %>%
+  st_as_sf(coords = c("lon", "lat"), crs = st_crs(4326)) %>%
+   st_transform(crs_eq_area)
+
+# Arrival of first languages
+t_initial <- historical_ie %>% 
+  filter(year == min(year)) %>%
+  pull(year)
+
+# Current snapshot
+t_final <- 1990
+
+# Time interval between snapshots
+delta_t <- 2
+```
+
+The first IE languages arrived in South America in `r t_initial`, with subsequent arrivals soon after. @tbl-IE-arrivals shows the most important early IE settlements in South America and the year they were founded.
+
+```{r, table, echo = F}
+#| tbl-cap: "First IE arrivals in South America"
+#| label: tbl-IE-arrivals
+#| tbl-colwidths: [60,40]
+#| tbl-cap-location: margin
+
+kable(historical_ie %>%
+        as.data.frame() %>%
+        dplyr::select (name, year),
+      col.names = c("Settlement", "Year"))
+```
+
+The current geographic distribution was mapped for `r t_final`, yielding `r t_final - t_initial` years during which IE diffused in South America. `sBread` models the spatial diffusion as consecutive snapshots linked with a Markov process. Each snapshot shows the geographic distribution of languages at a specific point in time, with `1` indicating the presence of IE, `0`the absence and `-1` unknown. The initial and final snapshots are known, all others unknown, except for locations with subsequent IE arrivals.
+
+For ease of analysis, the time interval between two snapshots should be a multiple of a year. Here, we use two years, yielding `r (t_final - t_initial) / delta_t + 1` snapshots. We collect the history in a matrix, where a row is a snapshot at time `t`, and a column is the spatial location in the grid.
+
+```{r matching}
+t_snapshots <- seq(t_initial, t_final, by = delta_t)
+
+# For each new arrival find the closest year in t_snapshots
+historical_ie <- historical_ie %>% 
+  rowwise() %>%
+  mutate(match_year = min(t_snapshots[t_snapshots >= year]))
+
+history <- sapply(t_snapshots, function (t) {
+  if (t == t_initial) {
+    ifelse(st_intersects(america_grid, historical_ie %>%
+                           filter(match_year == t), sparse = F) %>%
+             rowSums() > 0L, 1, 0)
+  } else if (t == t_final) {
+    ifelse(st_intersects(america_grid, current_ie, sparse = F) %>% 
+             rowSums() > 0L, 1, 0)
+  } else {
+    ifelse(st_intersects(america_grid, historical_ie %>%
+                           filter(match_year == t), sparse = F) %>% 
+             rowSums() > 0L, 1, -1)}}, simplify = T) %>% t 
+
+```
+
+The plot below shows the initial and current distribution of the IE languages in South America.
+
+```{r plot intial current, fig.height = 20}
+
+# Join the first and last row of the matrix with the grid 
+america_grid <- america_grid %>% left_join(
+  data.frame(initial = history[1, ],
+             current = history[nrow(history), ]) %>%
+  mutate(id = row_number()), by = "id")
+
+america_initial_map <- ggplot(america_grid) +
+  geom_sf(mapping = aes(fill = factor(initial))) +
+  ggtitle("1509") +
+  labs(fill = NULL) +
+  scale_fill_discrete(labels = c("indigenous", "Indo-European")) +
+  theme_minimal() 
+
+america_current_map <- ggplot(america_grid) +
+  geom_sf(mapping = aes(fill = factor(current))) +
+  ggtitle("1990") +
+  labs(fill = NULL) +
+  scale_fill_discrete(labels = c("indigenous", "Indo-European")) +
+  theme_minimal() 
+
+grid.arrange(america_initial_map, america_current_map, ncol = 1, nrow = 2)
+```
+
+## Grid neighbours
+
+We evaluate the neighbourhood relationships in the hexagonal grid. Two cells are considered neighbours if they share a common border. We convert neighbourhoods into a graph and extract the adjacency list.
+
+```{r neighbourhood, message=FALSE}
+
+america_graph <- poly2nb(america_grid) %>% 
+  nb2mat(style = "B") %>%
+  graph_from_adjacency_matrix(mode = "undirected") 
+
+america_adj_list <- as_adj_list(america_graph)
+
+america_edges <- as.data.frame(get.edgelist(america_graph))
+```
+
+
+## Shortest path 
+
+We compute the shortest path between all grid neighbours using Tobler's hiking function and record the hiking distance in seconds. 
+
+```{r read the dem data}
+
+
+#' Checks if a shortest path runs along one of the raster's border cells
+#'
+#' @param path the shortest path (Raster)
+#'
+#' @return (logical) Does the shortest path runs along the raster's border cells
+
+is_path_on_border <- function(path) {
+  
+    is_top <- any(!is.na(path[0,]))
+    is_bottom <- any(!is.na(path[nrow(path),]))
+    is_left <- any(!is.na(path[, 0]))
+    is_right <- any(!is.na(path[, ncol(path)]))
+    
+    return(any(is_top, is_bottom, is_left, is_right))
+  }
+
+
+#' Compute the altitude difference between two raster cells
+#'
+#' @param x two raster cells
+#'
+#' @return altitude difference
+#' 
+altitude_difference <- function(x) { x[2] - x[1] }
+
+
+#' Evaluate Tobler's hiking function for a raster cell
+#'
+#' @param sl slope of the raster cell 
+#' @param off_path_correction include a correction factor for walking off paths?
+#'
+#' @return the hiking speed [m/s] along the cell 
+toblers_hiking_function <- function(sl, off_path_correction) {
+  
+  # https://gis.stackexchange.com/questions/286695/toblers-hiking-function-resulting-walking-speed-in-kmh-or-m-s
+  
+  hs <- 6 * exp(-3.5 * abs(sl + 0.05)) / 3.6
+  
+  if (off_path_correction) hs <- hs * 3/5
+  return (hs)
+}
+
+
+#' Compute the hiking time [s] along the shortest path between two centroids of a grid
+#' cell using Tobler's hiking function 
+#' @param dem a digital elevation model (raster)
+#' @param grid the grid (sf)
+#' @param from_cell id of the origin of the shortest path (integer)
+#' @param to_cell id of the destination of the shortest path (integer)
+#' @param file_name name of the csv file to write the results (char)
+#'
+#' @return the hiking time [s]
+
+hiking_time <- function (dem, grid, from_cell, to_cell, file_name)  {
+  suppressWarnings({
+    
+  # Cookie-cut the raster
+  subset_dem <- crop(dem, grid %>% 
+                       filter(id %in% c(from_cell, to_cell)))
+  
+  alt_diff <- transition(subset_dem, altitude_difference, 8, symm = FALSE)
+  slope <- geoCorrection(alt_diff)
+  adj <- adjacent(alt_diff, cells = 1:ncell(alt_diff),
+                  pairs = TRUE, directions = 8)
+  rm(alt_diff)
+  
+  speed <- slope
+  speed[adj] <- toblers_hiking_function(slope[adj], off_path_correction=T)
+  rm(slope)
+  
+  conductance <- geoCorrection(speed) 
+  rm(speed)
+  
+  A <- st_centroid(grid %>% filter(id == from_cell)) %>%
+    st_coordinates()
+  B <- st_centroid(grid %>% filter(id == to_cell)) %>%
+    st_coordinates()
+  
+  cost_AB <- costDistance(conductance, A, B)
+  cost_BA <- costDistance(conductance, B, A)
+  
+  path_AB <- raster(shortestPath(conductance, A, B))
+  path_BA <- raster(shortestPath(conductance, B, A))
+  
+  # Check if shortest path touches the border of the raster
+  cost_AB <- ifelse(is_path_on_border(path_AB), NA, cost_AB)
+  cost_BA <- ifelse(is_path_on_border(path_BA), NA, cost_BA)
+  
+  row <- data.frame(
+    from = from_cell,
+    to = to_cell,
+    hiking_time_to = round(cost_AB, 0),
+    hiking_time_back = round(cost_BA, 0)
+  )
+  
+  write.table(row, file = file_name, append = TRUE, sep = ",", 
+              col.names = FALSE, row.names = FALSE)
+  })
+}
+
+
+# Initialise csv 
+initial_data <- data.frame(
+  from = integer(),
+  to = integer(),
+  hiking_time_to = numeric(),
+  hiking_time_back = numeric()
+)
+
+csv_fn = "hiking_times.csv"
+
+# We might want to be careful about this
+ if (file.exists(csv_fn)) {
+    file.remove(csv_fn)
+  }
+
+write.csv(initial_data, file = csv_fn, row.names = FALSE)
+
+
+america_dem <- raster("data/dem/sa_dem_ea.tif") 
+
+
+# Compute the Hiking time per row  
+hiking_time_per_row <- function(row) {hiking_time(america_dem, america_grid, 
+                                                  from_cell = row$V1, 
+                                                  to_cell =row$V2,
+                                                  file_name = csv_fn)}
+
+# Apply to each row 
+america_edges %>%
+  rowwise() %>%
+  do(hiking_time_per_row(.))
+
+
+```
